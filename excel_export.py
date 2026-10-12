@@ -101,12 +101,13 @@ def build_workbook(
     ws_sum["B3"].font = Font(italic=True, size=10)
 
     stats = [
-        ("Total Input SKUs",         summary_stats.get("total_input", "—")),
-        ("Exception SKUs (Rules R1-R11)", summary_stats.get("flagged", "—")),
-        ("Linked Siblings Flagged",   summary_stats.get("siblings", "—")),
-        ("HIGH Priority",             summary_stats.get("high", "—")),
-        ("MEDIUM Priority",           summary_stats.get("medium", "—")),
-        ("Daily Cap Applied",         summary_stats.get("cap", 500)),
+        ("List covers",              summary_stats.get("list_label", "Whole store")),
+        ("SKUs in scope (whole store)", summary_stats.get("total_input", "—")),
+        ("Exception SKUs, whole store (R1-R11)", summary_stats.get("flagged", "—")),
+        ("Linked Siblings, whole store", summary_stats.get("siblings", "—")),
+        ("HIGH, whole store",           summary_stats.get("high", "—")),
+        ("MEDIUM, whole store",         summary_stats.get("medium", "—")),
+        ("Daily cap applied (SKUs)",   summary_stats.get("cap", 500)),
         ("SKUs in This Output",       len(priority_df)),
     ]
     ws_sum["B5"] = "Metric"
@@ -123,21 +124,21 @@ def build_workbook(
             for c in [2, 3]:
                 ws_sum.cell(row=i, column=c).fill = PatternFill("solid", fgColor=CLR_LIGHT)
 
-    ws_sum["B14"] = "Severity Legend"
-    ws_sum["B14"].font = Font(bold=True)
+    ws_sum["B15"] = "Severity Legend"
+    ws_sum["B15"].font = Font(bold=True)
     legend = [
         ("HIGH",           CLR_RED,    "Negative / critical stock anomaly — count today"),
         ("MEDIUM",         CLR_ORANGE, "Slow-mover / receipt anomaly — count within 3 days"),
         ("PROMO PARENT",   CLR_PURPLE, "Promo/assorted pack linked to a negative component — check and adjust"),
         ("LINKED SIBLING", CLR_YELLOW, "Same-family SKU with a negative sibling — verify count"),
     ]
-    for i, (label, clr, note) in enumerate(legend, 15):
+    for i, (label, clr, note) in enumerate(legend, 16):
         ws_sum.cell(row=i, column=2, value=label).fill = PatternFill("solid", fgColor=clr)
         ws_sum.cell(row=i, column=2).font = Font(bold=True)
         ws_sum.cell(row=i, column=3, value=note)
 
     for col in ["B", "C", "D"]:
-        ws_sum.column_dimensions[col].width = 38 if col == "C" else 20
+        ws_sum.column_dimensions[col].width = 38 if col == "C" else (40 if col == "B" else 20)
 
     # ── Sheet 2: Top SKUs (Priority List) ─────────────────────────────────
     ws_top = wb.create_sheet("Top Priority SKUs")

@@ -222,6 +222,7 @@ def flag_siblings(flagged_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFra
     )
 
     full_df["Is_Negative_Trigger"] = full_df["Material"].isin(neg_triggers["Material"])
+    flagged_mats = set(flagged_df["Material"])   # set lookup: same result, far faster
 
     def sibling_of(row):
         if row["Is_Negative_Trigger"]:
@@ -230,7 +231,7 @@ def flag_siblings(flagged_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFra
         if k3 in key3_to_neg:
             parents = key3_to_neg[k3]
             # don't flag if the row is already in flagged_df (it has its own rule)
-            if row["Material"] not in flagged_df["Material"].values:
+            if row["Material"] not in flagged_mats:
                 return ", ".join(str(m) for m in parents)
         return ""
 
