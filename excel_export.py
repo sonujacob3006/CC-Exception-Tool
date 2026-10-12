@@ -15,8 +15,9 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ─── BRAND COLOURS (Al Meera) ─────────────────────────────────────────────────
 CLR_RED     = "FFC00000"   # HIGH
-CLR_ORANGE  = "FFFF6600"   # MEDIUM  (using orange-ish red)
+CLR_ORANGE  = "FFFF6600"   # MEDIUM
 CLR_YELLOW  = "FFFFC000"   # LINKED SIBLING
+CLR_PURPLE  = "FF7030A0"   # PROMO PARENT
 CLR_HEADER  = "FF1F3864"   # Dark navy header
 CLR_WHITE   = "FFFFFFFF"
 CLR_LIGHT   = "FFD9E1F2"   # Light blue row alt
@@ -53,6 +54,7 @@ def _severity_fill(severity: str) -> PatternFill | None:
         "HIGH": PatternFill("solid", fgColor=CLR_RED),
         "MEDIUM": PatternFill("solid", fgColor=CLR_ORANGE),
         "LINKED SIBLING": PatternFill("solid", fgColor=CLR_YELLOW),
+        "PROMO PARENT": PatternFill("solid", fgColor=CLR_PURPLE),
     }
     return m.get(severity)
 
@@ -123,9 +125,12 @@ def build_workbook(
 
     ws_sum["B14"] = "Severity Legend"
     ws_sum["B14"].font = Font(bold=True)
-    legend = [("HIGH", CLR_RED, "Negative / critical stock anomaly — count today"),
-              ("MEDIUM", CLR_ORANGE, "Slow-mover / receipt anomaly — count within 3 days"),
-              ("LINKED SIBLING", CLR_YELLOW, "Same-family SKU with a negative sibling — verify count")]
+    legend = [
+        ("HIGH",           CLR_RED,    "Negative / critical stock anomaly — count today"),
+        ("MEDIUM",         CLR_ORANGE, "Slow-mover / receipt anomaly — count within 3 days"),
+        ("PROMO PARENT",   CLR_PURPLE, "Promo/assorted pack linked to a negative component — check and adjust"),
+        ("LINKED SIBLING", CLR_YELLOW, "Same-family SKU with a negative sibling — verify count"),
+    ]
     for i, (label, clr, note) in enumerate(legend, 15):
         ws_sum.cell(row=i, column=2, value=label).fill = PatternFill("solid", fgColor=clr)
         ws_sum.cell(row=i, column=2).font = Font(bold=True)
@@ -209,7 +214,25 @@ def build_workbook(
     _write_df_to_sheet(ws_sib, sib_df, sev_col="Severity" if "Severity" in display_cols else None)
     _auto_width(ws_sib)
 
-    # ── Sheet 6: Rotation History (optional) ──────────────────────────────
+    # ── Sheet 6: Promo Parents ─────────────────────────────────────────────
+    promo_df_sheet = priority_df[priority_df["Severity"] == "PROMO PARENT"].copy()
+    if not promo_df_sheet.empty:
+        ws_promo = wb.create_sheet("Promo Parents")
+        ws_promo.sheet_view.showGridLines = False
+        ws_promo.freeze_panes = "A2"
+        # Add Promo_Parent_Of column if present
+        promo_extra = [c for c in ["Promo_Parent_Of"] if c in priority_df.columns]
+        promo_display = display_cols + promo_extra
+        promo_display = [c for c in promo_display if c in promo_df_sheet.columns]
+        promo_pretty = [header_labels.get(c, c.replace("_", " ")) for c in promo_display]
+        _header_row(ws_promo, promo_pretty)
+        _write_df_to_sheet(
+            ws_promo, promo_df_sheet[promo_display],
+            sev_col="Severity" if "Severity" in promo_display else None
+        )
+        _auto_width(ws_promo)
+
+    # ── Sheet 7: Rotation History (optional) ──────────────────────────────
     if history_df is not None and not history_df.empty:
         ws_hist = wb.create_sheet("Rotation History")
         ws_hist.sheet_view.showGridLines = False

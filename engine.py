@@ -2,6 +2,7 @@
 Cycle Count Exception Engine — Al Meera Consumer Goods
 Rules R1-R11 (R8 dropped as mathematically invalid)
 Priority scoring: severity × sales_velocity × recency_weight
+Promo parent detection: brand-word + promo-keyword matching
 """
 
 import pandas as pd
@@ -10,15 +11,40 @@ import re
 
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
-SEVERITY = {"HIGH": 3, "MEDIUM": 2, "LINKED SIBLING": 1}
+SEVERITY = {"HIGH": 3, "MEDIUM": 2, "PROMO PARENT": 2, "LINKED SIBLING": 1}
 
 SPECIAL_CHARS = re.compile(r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]")
 STRIP_LEADING_AL = re.compile(r"^AL\s+", re.IGNORECASE)
 
+# ─── PROMO DETECTION CONSTANTS ────────────────────────────────────────────────
+# Phrases that, when found in a description, identify a promo / assorted pack.
+# Checked as substrings against the fully cleaned (uppercase) description.
+PROMO_PHRASES = [
+    "PROMO", "PROMOTION", "PROMOTIONAL",
+    "ASSORTED", "ASST",
+    "BUNDLE",
+    "OFFER",
+    "GIFT SET", "GIFT PACK", "GIFTSET",
+    "COMBO",
+    "VARIETY",
+    "MULTIPACK", "MULTI PACK",
+    "VALUE PACK",
+    "MIXED PACK",
+]
+
+# Words too generic to serve as a brand identifier.
+_BRAND_STOPWORDS = frozenset([
+    "THE", "NEW", "MINI", "SUPER", "FRESH", "PURE", "EXTRA", "ULTRA",
+    "ORIGINAL", "CLASSIC", "PREMIUM", "NATURAL", "LITE", "LIGHT",
+    "BIG", "LARGE", "SMALL", "MEDIUM", "SPECIAL", "SELECTED",
+    "MIXED", "MIX", "ASSORTED", "BUNDLE", "PROMO", "OFFER",
+    "VARIETY", "COMBO", "VALUE", "MULTI",
+])
+
 
 # ─── KEY3 HELPERS ─────────────────────────────────────────────────────────────
 def clean_desc(desc: str) -> str:
-    """Clean description for Key3 pairing: strip leading AL, replace special chars with space, normalise spaces."""
+    """Clean description for matching: strip leading AL, replace special chars, normalise spaces."""
     if not isinstance(desc, str):
         return ""
     d = STRIP_LEADING_AL.sub("", desc.strip())
@@ -31,6 +57,25 @@ def make_key3(desc: str) -> str:
     """Return first 3 words of cleaned description."""
     words = clean_desc(desc).split()
     return " ".join(words[:3]) if len(words) >= 3 else " ".join(words)
+
+
+def _extract_brand(desc: str) -> str:
+    """
+    Return the first meaningful (non-stopword, ≥3 chars) word from the cleaned
+    description.  This is used as the brand identifier for promo-parent matching.
+    Falls back to the raw first word if every word is a stopword.
+    """
+    words = clean_desc(desc).split()
+    for w in words:
+        if w not in _BRAND_STOPWORDS and len(w) >= 3:
+            return w
+    return words[0] if words else ""
+
+
+def _has_promo_phrase(desc: str) -> bool:
+    """Return True if the cleaned description contains any promo phrase."""
+    cleaned = clean_desc(desc)
+    return any(phrase in cleaned for phrase in PROMO_PHRASES)
 
 
 # ─── RULE ENGINE ──────────────────────────────────────────────────────────────
@@ -168,7 +213,6 @@ def flag_siblings(flagged_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFra
     flagged_df["Key3"] = flagged_df["Material_Desc"].apply(make_key3)
 
     neg_triggers = flagged_df[flagged_df["Rule_Fired"].apply(has_neg)][["Material", "Key3"]].copy()
-    neg_trigger_keys = set(neg_triggers["Key3"].unique())
 
     # build map key3 → list of negative-trigger materials
     key3_to_neg = (
@@ -198,16 +242,97 @@ def flag_siblings(flagged_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFra
     return full_df
 
 
+# ─── PROMO PARENT DETECTION ───────────────────────────────────────────────────
+def flag_promo_parents(flagged_df: pd.DataFrame, full_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect promo / assorted pack SKUs whose stock may be inflated because a component
+    SKU went negative (open box / broken promo).
+
+    Logic:
+    1. Find all R1/R2/R11 negative triggers in flagged_df.
+    2. Extract the brand word (first meaningful word) from each trigger's description.
+    3. Scan full_df for SKUs that share that brand word AND contain a promo keyword
+       phrase in their description, but are NOT already flagged exceptions.
+    4. Mark those SKUs as PROMO PARENT and record which negative material triggered
+       the match.
+
+    Returns full_df with added columns:
+        Promo_Parent_Of — comma-separated negative trigger materials
+        Promo_Flag      — "PROMO PARENT" if matched, else ""
+    """
+    full_df = full_df.copy()
+
+    neg_rules = {"R1", "R2", "R11"}
+
+    def has_neg(rule_str):
+        if not isinstance(rule_str, str):
+            return False
+        fired = {r.strip() for r in rule_str.split(",")}
+        return bool(fired & neg_rules)
+
+    flagged_copy = flagged_df.copy()
+    neg_triggers = flagged_copy[flagged_copy["Rule_Fired"].apply(has_neg)].copy()
+
+    if neg_triggers.empty:
+        full_df["Promo_Parent_Of"] = ""
+        full_df["Promo_Flag"] = ""
+        return full_df
+
+    # Build brand → list of negative trigger materials
+    neg_triggers["_Brand"] = neg_triggers["Material_Desc"].apply(_extract_brand)
+    brand_to_negs: dict[str, list] = {}
+    for _, row in neg_triggers.iterrows():
+        brand = row["_Brand"]
+        if brand and len(brand) >= 3:
+            brand_to_negs.setdefault(brand, []).append(str(row["Material"]))
+
+    if not brand_to_negs:
+        full_df["Promo_Parent_Of"] = ""
+        full_df["Promo_Flag"] = ""
+        return full_df
+
+    # Materials already flagged as exceptions — don't double-flag them
+    flagged_mats = set(flagged_copy["Material"].astype(str).tolist())
+
+    # Compute brand word for every row in full_df
+    full_df["_BrandWord"] = full_df["Material_Desc"].apply(_extract_brand)
+
+    def check_promo(row) -> str:
+        mat = str(row.get("Material", ""))
+        if mat in flagged_mats:
+            return ""
+        brand = row.get("_BrandWord", "")
+        if not brand or brand not in brand_to_negs:
+            return ""
+        if not _has_promo_phrase(str(row.get("Material_Desc", ""))):
+            return ""
+        # Filter out self-reference
+        neg_mats = [m for m in brand_to_negs[brand] if m != mat]
+        if not neg_mats:
+            return ""
+        return ", ".join(neg_mats)
+
+    full_df["Promo_Parent_Of"] = full_df.apply(check_promo, axis=1)
+    full_df["Promo_Flag"] = full_df["Promo_Parent_Of"].apply(
+        lambda x: "PROMO PARENT" if x else ""
+    )
+    full_df = full_df.drop(columns=["_BrandWord"])
+
+    return full_df
+
+
 # ─── PRIORITY SCORING ─────────────────────────────────────────────────────────
 def priority_score(row: pd.Series, history: dict | None = None) -> float:
     """
     Priority = severity_weight × sales_velocity × recency_weight
-    severity_weight: HIGH=3, MEDIUM=2, SIBLING=1
+    severity_weight: HIGH=3, MEDIUM=2, PROMO PARENT=2, SIBLING=1
     sales_velocity:  daily sales rate = Sales30/30, floored at 0.01 to avoid zero
     recency_weight:  1 + 0.1 × days_since_last_flagged (capped at 3.0)
                      if no history → 1.0
     """
-    sev = SEVERITY.get(row.get("Severity") or row.get("Sibling_Flag") or "", 0)
+    sev = SEVERITY.get(
+        row.get("Severity") or row.get("Sibling_Flag") or row.get("Promo_Flag") or "", 0
+    )
     if sev == 0:
         return 0.0
 
@@ -225,11 +350,12 @@ def priority_score(row: pd.Series, history: dict | None = None) -> float:
 def build_priority_list(
     flagged_df: pd.DataFrame,
     sibling_df: pd.DataFrame,
+    promo_df: pd.DataFrame | None = None,
     history: dict | None = None,
     daily_cap: int | None = None,
 ) -> pd.DataFrame:
     """
-    Combine flagged SKUs + siblings, compute priority scores, sort descending.
+    Combine flagged SKUs + siblings + promo parents, compute priority scores, sort descending.
     Returns the FULL ranked list.  Caller applies daily_cap for the daily count list.
     daily_cap=None (default) returns all exceptions — used for category drill-down.
     Pass daily_cap=500 (or any int) to get the capped daily list directly.
@@ -247,7 +373,23 @@ def build_priority_list(
     sibs["Rule_Fired"] = "SIBLING"
     sibs["Source"] = "Linked Sibling"
 
-    combined = pd.concat([out, sibs], ignore_index=True)
+    already_in = set(out["Material"].astype(str)).union(set(sibs["Material"].astype(str)))
+
+    # promo parent rows (only those not already exception or sibling)
+    promo_rows = pd.DataFrame()
+    if promo_df is not None:
+        promo_rows = promo_df[
+            (promo_df["Promo_Flag"] == "PROMO PARENT")
+            & (~promo_df["Material"].astype(str).isin(already_in))
+        ].copy()
+        promo_rows["Severity"] = "PROMO PARENT"
+        promo_rows["Rule_Fired"] = "PROMO PARENT"
+        promo_rows["Source"] = "Promo Parent"
+
+    parts = [out, sibs]
+    if not promo_rows.empty:
+        parts.append(promo_rows)
+    combined = pd.concat(parts, ignore_index=True)
 
     combined["Priority_Score"] = combined.apply(
         lambda r: priority_score(r, history), axis=1

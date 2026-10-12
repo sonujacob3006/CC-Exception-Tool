@@ -9,7 +9,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from engine import apply_rules, flag_siblings, build_priority_list
+from engine import apply_rules, flag_siblings, flag_promo_parents, build_priority_list
 from master_utils import build_lookup, enrich, available_levels, HIER_COLS
 from scheduler import RotationHistory, is_valid_count_day, build_calendar
 from excel_export import build_workbook
@@ -101,6 +101,10 @@ with st.sidebar:
                  "R10":"Receipts>0 & DoC≤5 → HIGH","R11":"Both SOH<0 → HIGH"}
     for c, d in rules_ref.items():
         st.markdown(f"**{c}** {d}")
+    st.divider()
+    st.markdown("**🟣 Promo Parent**")
+    st.caption("Promo/assorted pack whose brand matches a negative-SOH component — "
+               "count to confirm if an open box explains the negative stock.")
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def _apply_l2_cap(full_df: pd.DataFrame, cap: int,
@@ -206,10 +210,16 @@ with tab_upload:
                 flagged_only = flagged[flagged["Rule_Fired"] != ""]
                 sibling_result = flag_siblings(flagged_only, flagged)
 
-                # 3. Full ranked list — NO cap
+                # 3. Promo parents
+                promo_result = flag_promo_parents(flagged_only, flagged)
+
+                # 4. Full ranked list — NO cap
                 history_dict = st.session_state.history.as_days_dict(run_date)
-                full = build_priority_list(flagged_only, sibling_result,
-                                           history=history_dict, daily_cap=None)
+                full = build_priority_list(
+                    flagged_only, sibling_result,
+                    promo_df=promo_result,
+                    history=history_dict, daily_cap=None
+                )
 
                 # 4. Enrich with Article Master category hierarchy
                 if st.session_state.master_lookup is not None:
@@ -228,6 +238,7 @@ with tab_upload:
 
                 n_exc   = len(full[full["Source"] == "Exception"])
                 n_sibs  = len(full[full["Severity"] == "LINKED SIBLING"])
+                n_promo = len(full[full["Severity"] == "PROMO PARENT"])
                 n_high  = len(full[full["Severity"] == "HIGH"])
                 n_med   = len(full[full["Severity"] == "MEDIUM"])
                 n_daily = len(st.session_state.daily_df)
@@ -235,9 +246,11 @@ with tab_upload:
                 has_master = st.session_state.master_lookup is not None
                 cap_msg = (f"top {int(daily_cap)} per L2 dept" if has_master
                            else f"top {int(daily_cap)} global (no Article Master)")
+                promo_msg = f" · 🟣 Promo Parents {n_promo}" if n_promo else ""
                 st.success(
-                    f"✅  {n_exc:,} exceptions + {n_sibs:,} siblings = "
-                    f"{len(full):,} total  |  HIGH {n_high} · MEDIUM {n_med}  |  "
+                    f"✅  {n_exc:,} exceptions + {n_sibs:,} siblings"
+                    f"{promo_msg} = {len(full):,} total  |  "
+                    f"HIGH {n_high} · MEDIUM {n_med}  |  "
                     f"Daily list ({cap_msg}): {n_daily} SKUs"
                 )
                 cat_msg = (" Category drill-down enabled (shows ALL exceptions per category)."
@@ -273,12 +286,13 @@ with tab_exc:
                 f"📌 Global cap of **{int(daily_cap)}** — upload Article Master to switch to per-L2 capping."
             )
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("In Daily List", len(df))
         c2.metric("HIGH",   len(df[df["Severity"]=="HIGH"]))
         c3.metric("MEDIUM", len(df[df["Severity"]=="MEDIUM"]))
-        c4.metric("Siblings", len(df[df["Severity"]=="LINKED SIBLING"]))
-        c5.metric("All exceptions", len(st.session_state.full_df))
+        c4.metric("🟣 Promo Parents", len(df[df["Severity"]=="PROMO PARENT"]))
+        c5.metric("Siblings", len(df[df["Severity"]=="LINKED SIBLING"]))
+        c6.metric("All exceptions", len(st.session_state.full_df))
 
         # L2 breakdown table
         if has_l2:
@@ -300,8 +314,8 @@ with tab_exc:
 
         # Quick filters
         f1, f2, f3 = st.columns([2,2,3])
-        sev_f = f1.multiselect("Severity", ["HIGH","MEDIUM","LINKED SIBLING"],
-                               default=["HIGH","MEDIUM","LINKED SIBLING"])
+        sev_f = f1.multiselect("Severity", ["HIGH","MEDIUM","PROMO PARENT","LINKED SIBLING"],
+                               default=["HIGH","MEDIUM","PROMO PARENT","LINKED SIBLING"])
         rule_f = f2.text_input("Rule (e.g. R1)")
         desc_f = f3.text_input("Search description")
 
@@ -317,12 +331,13 @@ with tab_exc:
 
         def highlight_sev(row):
             c = {"HIGH":"background-color:#FFC0C0","MEDIUM":"background-color:#FFE0C0",
+                 "PROMO PARENT":"background-color:#E5C8F0",
                  "LINKED SIBLING":"background-color:#FFF0A0"}
             return [c.get(row.get("Severity",""),"")] * len(row)
 
         disp = [c for c in ["Daily_Rank","Material","Material_Desc","Severity","Rule_Fired",
-                             "Priority_Score","Opening_SOH","Closing_SOH","Sales30",
-                             "Receipts10","DoC"] if c in view.columns]
+                             "Promo_Parent_Of","Priority_Score","Opening_SOH","Closing_SOH",
+                             "Sales30","Receipts10","DoC"] if c in view.columns]
         st.dataframe(view[disp].style.apply(highlight_sev, axis=1),
                      use_container_width=True, height=520)
 
@@ -396,8 +411,8 @@ with tab_drill:
                 # ── Severity filter inside drill-down ─────────────────────
                 sev_drill = st.multiselect(
                     "Filter severity within this category",
-                    ["HIGH","MEDIUM","LINKED SIBLING"],
-                    default=["HIGH","MEDIUM","LINKED SIBLING"],
+                    ["HIGH","MEDIUM","PROMO PARENT","LINKED SIBLING"],
+                    default=["HIGH","MEDIUM","PROMO PARENT","LINKED SIBLING"],
                     key="sev_drill"
                 )
                 if sev_drill:
@@ -408,6 +423,7 @@ with tab_drill:
                 def highlight_sev(row):
                     c = {"HIGH":"background-color:#FFC0C0",
                          "MEDIUM":"background-color:#FFE0C0",
+                         "PROMO PARENT":"background-color:#E5C8F0",
                          "LINKED SIBLING":"background-color:#FFF0A0"}
                     return [c.get(row.get("Severity",""),"")] * len(row)
 
@@ -464,6 +480,26 @@ with tab_analysis:
             rd = pd.DataFrame(rc.most_common(10), columns=["Rule","Count"])
             st.dataframe(rd, use_container_width=True, hide_index=True)
 
+        # Promo parent list
+        promo_full = full[full["Severity"] == "PROMO PARENT"]
+        if not promo_full.empty:
+            st.divider()
+            st.subheader(f"🟣 Promo Parents ({len(promo_full)} SKUs)")
+            st.caption(
+                "These promo / assorted packs share a brand with a negative-SOH component. "
+                "Count them to confirm whether opening the pack explains the negative stock."
+            )
+            promo_show_cols = [c for c in [
+                "Daily_Rank","Material","Material_Desc","Promo_Parent_Of",
+                "Priority_Score","Opening_SOH","Closing_SOH","Sales30"
+            ] if c in promo_full.columns]
+            st.dataframe(
+                promo_full[promo_show_cols].style.apply(
+                    lambda row: ["background-color:#E5C8F0"] * len(row), axis=1
+                ),
+                use_container_width=True, hide_index=True
+            )
+
         # Category breakdown if hierarchy is available
         levels = available_levels(full)
         if levels:
@@ -471,11 +507,12 @@ with tab_analysis:
             st.subheader("Exceptions by Category")
             lvl_sel = st.selectbox("Group by", levels,
                                    format_func=lambda x: x.replace(" Desc",""))
-            grp = (full[full["Severity"].isin(["HIGH","MEDIUM"])]
+            grp = (full[full["Severity"].isin(["HIGH","MEDIUM","PROMO PARENT"])]
                    .groupby(lvl_sel)
                    .agg(Total=("Material","count"),
                         HIGH=("Severity", lambda s: (s=="HIGH").sum()),
-                        MEDIUM=("Severity", lambda s: (s=="MEDIUM").sum()))
+                        MEDIUM=("Severity", lambda s: (s=="MEDIUM").sum()),
+                        Promo=("Severity", lambda s: (s=="PROMO PARENT").sum()))
                    .sort_values("Total", ascending=False)
                    .reset_index())
             st.dataframe(grp, use_container_width=True, hide_index=True)
@@ -555,4 +592,4 @@ with tab_dl:
                            f"CC_DailyList_{run_date.strftime('%Y%m%d')}.csv", "text/csv")
 
 st.markdown("---")
-st.caption(f"Al Meera Consumer Goods · Cycle Count Exception Tool · v1.2 · {date.today().strftime('%b %Y')}")
+st.caption(f"Al Meera Consumer Goods · Cycle Count Exception Tool · v1.3 · {date.today().strftime('%b %Y')}")
